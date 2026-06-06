@@ -1,0 +1,55 @@
+{
+  "name": "bucket-no-more",
+  "version": "1.0.0",
+  "description": "Enterprise-grade reference implementation for multi-merchant agentic commerce: UCP (Universal Commerce Protocol), A2A (Agent2Agent), AP2 payments, and the Universal Shopping Cart. Deep dives into multi-merchant checkout orchestration and agent authentication/authorization.",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "rm -rf dist",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "demo": "tsx demo/end-to-end.ts",
+    "demo:checkout": "tsx examples/multi-merchant-checkout.ts",
+    "demo:auth": "tsx examples/auth-flow.ts",
+    "lint": "eslint . --ext .ts",
+    "test": "node --test",
+    "docs:serve": "npx serve docs"
+  },
+  "keywords": [
+    "agentic-commerce",
+    "ucp",
+    "a2a",
+    "ap2",
+    "universal-cart",
+    "multi-merchant",
+    "checkout-orchestration",
+    "agent-card",
+    "jwt",
+    "oauth2",
+    "saga",
+    "transaction-coordination"
+  ],
+  "author": "Arjun Basu <arjun-basu001@users.noreply.github.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/arjun-basu001/bucket-no-more.git"
+  },
+  "homepage": "https://github.com/arjun-basu001/bucket-no-more#readme",
+  "bugs": {
+    "url": "https://github.com/arjun-basu001/bucket-no-more/issues"
+  },
+  "dependencies": {
+    "jose": "^5.9.6",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.9.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3"
+  }
+}

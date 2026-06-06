@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>UCP · A2A · Agent Cards · bucket-no-more</title>
+  <link rel="stylesheet" href="../css/style.css" />
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css" />
+</head>
+<body>
+  <button class="menu-toggle" aria-label="Toggle menu">☰</button>
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="brand"><span class="logo">🛒</span> bucket-no-more</div>
+      <p class="tagline">One basket. Many merchants.</p>
+      <nav>
+        <div class="nav-group">
+          <h4>Overview</h4>
+          <a href="../index.html">Introduction</a>
+          <a href="../index.html#architecture">Architecture</a>
+          <a href="../index.html#quickstart">Quick start</a>
+        </div>
+        <div class="nav-group">
+          <h4>Deep dives</h4>
+          <a href="checkout.html">🧩 Checkout orchestration</a>
+          <a href="auth.html">🔐 Auth &amp; Authz</a>
+        </div>
+        <div class="nav-group">
+          <h4>Protocols</h4>
+          <a href="protocols.html">UCP · A2A · Agent Cards</a>
+        </div>
+        <div class="nav-group">
+          <h4>Reference</h4>
+          <a href="https://github.com/arjun-basu001/bucket-no-more">GitHub repo ↗</a>
+        </div>
+      </nav>
+    </aside>
+
+    <main class="content">
+      <span class="badge">PROTOCOLS</span>
+      <h1>UCP · A2A · Agent Cards</h1>
+      <p class="lead muted">The supporting plumbing that lets a shopping agent discover merchants, read their catalogs, and speak a common language.</p>
+
+      <h2 id="ucp">📦 UCP — Universal Commerce Protocol</h2>
+      <p>UCP defines a <strong>unified product schema</strong> so a shopping agent can read catalogs from many merchants through one shape, regardless of each merchant's internal data model. A merchant agent exposes its catalog as UCP products; the shopping agent queries and composes them into a Universal Cart.</p>
+      <pre><code class="language-typescript">const catalog = new UCPCatalog('audiophile');
+catalog.upsert(normalizeToUCP(rawMerchantPayload, 'audiophile'));
+
+const results = catalog.search({ text: 'headphones', maxPriceMinor: 30000, inStockOnly: true });
+const lineItem = catalog.toLineItem('sku-aurora-headphones', 1);  // → Universal Cart line</code></pre>
+      <p>The schema is validated with <strong>zod</strong> (fail fast, friendly errors) and supports money in integer minor units, availability states, variants/SKUs, categories, and a passthrough <code>attributes</code> bag for merchant-specific fields.</p>
+      <div class="diagram">
+        <pre class="mermaid">
+flowchart LR
+    M1["Merchant A payload"] --> N["normalizeToUCP()"]
+    M2["Merchant B payload"] --> N
+    N --> P["UCPProduct (validated)"]
+    P --> CAT["UCPCatalog.search / toLineItem"]
+    CAT --> CART["Universal Cart line items"]
+        </pre>
+        <div class="caption">Heterogeneous merchant data → one validated UCP shape.</div>
+      </div>
+
+      <h2 id="cards">🪪 Agent Cards</h2>
+      <p>An Agent Card is the A2A <strong>discovery document</strong>: a signed JSON object an agent publishes (typically at <code>/.well-known/agent-card.json</code>) so peers can learn who it is, where to reach it, what it can do, and how to authenticate to it.</p>
+      <pre><code class="language-json">{
+  "schemaVersion": "1.0",
+  "id": "agent://fleetfoot/merchant-agent",
+  "name": "FleetFoot Merchant Agent",
+  "endpoint": "https://api.fleetfoot.example/a2a",
+  "provider": { "name": "FleetFoot Inc." },
+  "auth": {
+    "type": "oauth2-client-credentials",
+    "tokenEndpoint": "https://auth.fleetfoot.example/token",
+    "jwksUri": "https://auth.fleetfoot.example/jwks",
+    "scopes": ["catalog:read", "checkout:execute"]
+  },
+  "capabilities": [
+    { "id": "search", "name": "Catalog", "method": "ucp.catalog.search" },
+    { "id": "reserve", "name": "Checkout", "method": "checkout.reserve" }
+  ],
+  "proof": { "type": "JsonWebSignature2020", "verificationMethod": "...#key-1", "jws": "..." }
+}</code></pre>
+      <p>Cards are created, signed, and validated through <code>createSignedAgentCard()</code> / <code>verifySignedAgentCard()</code>. Structure is validated with zod; the signature uses the canonical-JSON detached JWS scheme covered in the <a href="auth.html">Auth deep dive</a>.</p>
+
+      <h2 id="a2a">🤝 A2A — the trust handshake</h2>
+      <p>Before two agents transact, they perform a discovery + trust handshake. The output is a <code>Session</code> used to make authenticated A2A method calls (JSON-RPC 2.0 envelopes).</p>
+      <ol class="steps">
+        <li><strong>Discover</strong> — fetch the responder's signed Agent Card (from its well-known URL).</li>
+        <li><strong>Verify</strong> — validate the card signature against the responder's published key, anchoring trust.</li>
+        <li><strong>Negotiate</strong> — agree on a protocol version and the intersection of desired vs. advertised capabilities.</li>
+        <li><strong>Authenticate</strong> — obtain an OAuth2 access token scoped to the responder's audience.</li>
+      </ol>
+      <div class="diagram">
+        <pre class="mermaid">
+sequenceDiagram
+    participant SA as Shopping Agent
+    participant MA as Merchant Agent
+    participant AS as Auth Server
+    SA->>MA: GET /.well-known/agent-card.json
+    MA-->>SA: signed Agent Card
+    SA->>SA: verify card signature (trust anchored)
+    SA->>SA: negotiate version + capabilities
+    SA->>AS: client_credentials (audience = merchant API)
+    AS-->>SA: access token
+    Note over SA,MA: Session established → JSON-RPC method calls
+        </pre>
+        <div class="caption">Discover → Verify → Negotiate → Authenticate.</div>
+      </div>
+      <pre><code class="language-typescript">const session = await performHandshake({
+  responderCard: merchantCard,
+  responderPublicKey: merchantCardKey,
+  desiredMethods: ['ucp.catalog.search', 'checkout.reserve'],
+  oauthClient,                              // bound to the merchant token endpoint
+});
+// session.peer · session.protocolVersion · session.negotiatedMethods · session.getToken()</code></pre>
+
+      <h2 id="ap2">💳 AP2 — Agent Payment Protocol (in this codebase)</h2>
+      <p>AP2 governs <strong>payment mandates</strong>: a user delegates spend authority (up to a cap) to a shopping agent, which the orchestrator presents when authorizing charges. In this reference, the mandate flows through <code>CheckoutContext.paymentMandate</code> and underpins the authorize→capture split — funds are held under the mandate and only captured on full-basket success.</p>
+
+      <div class="pager">
+        <a href="auth.html"><span class="dir">← Previous</span><span class="title">Auth &amp; Authz</span></a>
+        <a class="next" href="../index.html"><span class="dir">Next →</span><span class="title">Back to overview</span></a>
+      </div>
+      <footer class="site">MIT © 2026 Arjun Basu</footer>
+    </main>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+  <script src="../js/main.js"></script>
+</body>
+</html>

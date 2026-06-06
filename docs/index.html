@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>bucket-no-more · Multi-Merchant Agentic Commerce</title>
+  <meta name="description" content="Enterprise reference implementation for multi-merchant agentic commerce: UCP, A2A, AP2 and the Universal Shopping Cart, with deep dives into checkout orchestration and agent auth." />
+  <link rel="stylesheet" href="css/style.css" />
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css" />
+</head>
+<body>
+  <button class="menu-toggle" aria-label="Toggle menu">☰</button>
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="brand"><span class="logo">🛒</span> bucket-no-more</div>
+      <p class="tagline">One basket. Many merchants.</p>
+      <nav>
+        <div class="nav-group">
+          <h4>Overview</h4>
+          <a href="index.html">Introduction</a>
+          <a href="index.html#architecture">Architecture</a>
+          <a href="index.html#quickstart">Quick start</a>
+        </div>
+        <div class="nav-group">
+          <h4>Deep dives</h4>
+          <a href="pages/checkout.html">🧩 Checkout orchestration</a>
+          <a href="pages/auth.html">🔐 Auth &amp; Authz</a>
+        </div>
+        <div class="nav-group">
+          <h4>Protocols</h4>
+          <a href="pages/protocols.html">UCP · A2A · Agent Cards</a>
+        </div>
+        <div class="nav-group">
+          <h4>Reference</h4>
+          <a href="https://github.com/arjun-basu001/bucket-no-more">GitHub repo ↗</a>
+        </div>
+      </nav>
+    </aside>
+
+    <main class="content">
+      <section class="hero">
+        <h1>Multi-Merchant Agentic Commerce</h1>
+        <p class="lead">A production-shaped reference implementation of the protocols behind the <strong>Universal Shopping Cart</strong> — UCP, A2A, and AP2 — with two engineering deep dives where the hard problems actually live.</p>
+        <div class="badges">
+          <span class="badge teal">UCP · Universal Commerce Protocol</span>
+          <span class="badge violet">A2A · Agent2Agent</span>
+          <span class="badge amber">AP2 · Agent Payments</span>
+          <span class="badge">TypeScript</span>
+          <span class="badge">MIT</span>
+        </div>
+      </section>
+
+      <p>When an autonomous shopping agent fills one basket from <em>many</em> independent merchants, two problems dominate the engineering: <strong>how do you check out atomically across systems you don't control</strong>, and <strong>how do agents authenticate and authorize each other safely</strong>? This codebase answers both with running TypeScript, then surrounds them with the supporting protocol plumbing.</p>
+
+      <div class="card-grid">
+        <a class="card" href="pages/checkout.html">
+          <div class="icon">🧩</div>
+          <h3>Checkout orchestration</h3>
+          <p>Saga / Try-Confirm-Cancel coordinator: cart aggregation, two-phase commit, rollback, refunds, idempotency, and every nasty edge case.</p>
+          <span class="tag">DEEP DIVE →</span>
+        </a>
+        <a class="card" href="pages/auth.html">
+          <div class="icon">🔐</div>
+          <h3>Auth &amp; Authz</h3>
+          <p>EdDSA JWTs, agent-card signature verification, OAuth2 client-credentials, scope enforcement, and token-bucket rate limiting.</p>
+          <span class="tag">DEEP DIVE →</span>
+        </a>
+        <a class="card" href="pages/protocols.html">
+          <div class="icon">📦</div>
+          <h3>UCP · A2A · Cards</h3>
+          <p>Unified catalog schema, agent discovery, the trust handshake, and JSON-RPC messaging that tie the merchants together.</p>
+          <span class="tag">PROTOCOLS →</span>
+        </a>
+      </div>
+
+      <h2 id="architecture">System architecture</h2>
+      <p>A shopping agent discovers and verifies each merchant agent over <strong>A2A</strong>, reads their <strong>UCP</strong> catalogs, aggregates a <strong>Universal Cart</strong>, then drives a single orchestrated checkout — guarded by the auth gateway and settled against an <strong>AP2</strong> payment mandate.</p>
+
+      <div class="diagram">
+        <pre class="mermaid">
+flowchart TB
+    User([User]) -->|intent| SA["Shopping Agent"]
+    subgraph DISC["A2A — Discovery & Trust"]
+        SA -->|verify Agent Card| MA1["Merchant Agent A"]
+        SA -->|verify Agent Card| MA2["Merchant Agent B"]
+    end
+    subgraph CAT["UCP — Unified Catalog"]
+        MA1 --> C1[("Catalog A")]
+        MA2 --> C2[("Catalog B")]
+    end
+    SA -->|aggregate| UC["Universal Cart"]
+    UC --> GW["Auth Gateway<br/>JWT · scopes · rate limit"]
+    GW --> ORCH["Checkout Orchestrator<br/>SAGA / TCC"]
+    ORCH -->|reserve→authorize→capture→confirm| MA1
+    ORCH --> MA2
+    ORCH -->|AP2 mandate| PAY["Payment / Settlement"]
+        </pre>
+        <div class="caption">End-to-end flow across discovery, catalog, cart, auth, and orchestration.</div>
+      </div>
+
+      <h2 id="quickstart">Quick start</h2>
+      <pre><code class="language-bash">git clone https://github.com/arjun-basu001/bucket-no-more.git
+cd bucket-no-more
+npm install
+
+npm run typecheck      # strict TypeScript
+npm run demo           # full end-to-end flow
+npm run demo:checkout  # happy path + rollback
+npm run demo:auth      # JWT, OAuth2, rate limiting, card signatures</code></pre>
+
+      <div class="callout">
+        <strong>Tip —</strong> every module is dependency-light and framework-agnostic. The seams (<code>MerchantAdapter</code>, <code>StateStore</code>, <code>BucketStore</code>) are interfaces you can back with Postgres, Redis, or your existing services.
+      </div>
+
+      <h2>What each module gives you</h2>
+      <table>
+        <thead><tr><th>Module</th><th>Responsibility</th></tr></thead>
+        <tbody>
+          <tr><td><code>src/checkout</code></td><td>Universal Cart aggregation &amp; the multi-merchant orchestrator (saga/TCC, rollback)</td></tr>
+          <tr><td><code>src/auth</code></td><td>JWT issue/verify, agent-card signatures, OAuth2, rate limiting, gateway</td></tr>
+          <tr><td><code>src/agent-card</code></td><td>Create &amp; validate signed A2A discovery documents</td></tr>
+          <tr><td><code>src/ucp</code></td><td>Unified product schema, normalization, catalog search</td></tr>
+          <tr><td><code>src/a2a</code></td><td>Discovery → verify → negotiate → authenticate handshake</td></tr>
+          <tr><td><code>src/common</code></td><td>Money arithmetic, typed Results, retry/backoff, structured logger</td></tr>
+        </tbody>
+      </table>
+
+      <div class="pager">
+        <span></span>
+        <a class="next" href="pages/checkout.html"><span class="dir">Next →</span><span class="title">Checkout orchestration deep dive</span></a>
+      </div>
+
+      <footer class="site">Built as a companion to the UCP / A2A / AP2 article · MIT © 2026 Arjun Basu</footer>
+    </main>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+  <script src="js/main.js"></script>
+</body>
+</html>

@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Auth &amp; Authz · bucket-no-more</title>
+  <link rel="stylesheet" href="../css/style.css" />
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css" />
+</head>
+<body>
+  <button class="menu-toggle" aria-label="Toggle menu">☰</button>
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="brand"><span class="logo">🛒</span> bucket-no-more</div>
+      <p class="tagline">One basket. Many merchants.</p>
+      <nav>
+        <div class="nav-group">
+          <h4>Overview</h4>
+          <a href="../index.html">Introduction</a>
+          <a href="../index.html#architecture">Architecture</a>
+          <a href="../index.html#quickstart">Quick start</a>
+        </div>
+        <div class="nav-group">
+          <h4>Deep dives</h4>
+          <a href="checkout.html">🧩 Checkout orchestration</a>
+          <a href="auth.html">🔐 Auth &amp; Authz</a>
+        </div>
+        <div class="nav-group">
+          <h4>Protocols</h4>
+          <a href="protocols.html">UCP · A2A · Agent Cards</a>
+        </div>
+        <div class="nav-group">
+          <h4>Reference</h4>
+          <a href="https://github.com/arjun-basu001/bucket-no-more">GitHub repo ↗</a>
+        </div>
+      </nav>
+    </aside>
+
+    <main class="content">
+      <span class="badge violet">DEEP DIVE</span>
+      <h1>🔐 Authentication &amp; authorization architecture</h1>
+      <p class="lead muted">Establishing trust between agents that have never met — and keeping a misbehaving one from ruining everyone's day.</p>
+
+      <h2>The three questions every request must answer</h2>
+      <div class="card-grid">
+        <div class="card"><div class="icon">🪪</div><h3>Who are you?</h3><p><strong>Authentication.</strong> Verify a signed JWT (and, at discovery, the agent's signed card).</p></div>
+        <div class="card"><div class="icon">✅</div><h3>What may you do?</h3><p><strong>Authorization.</strong> Enforce the OAuth2 scopes the endpoint requires.</p></div>
+        <div class="card"><div class="icon">🚦</div><h3>How often?</h3><p><strong>Abuse control.</strong> Token-bucket rate limit per authenticated agent.</p></div>
+      </div>
+
+      <h2>End-to-end token flow</h2>
+      <div class="diagram">
+        <pre class="mermaid">
+sequenceDiagram
+    participant SA as Shopping Agent
+    participant AS as Authorization Server
+    participant GW as Auth Gateway (Resource Server)
+    participant H as Handler
+    SA->>AS: POST /token (client_credentials, scopes, audience)
+    AS->>AS: verify client secret, down-scope
+    AS-->>SA: short-lived EdDSA JWT
+    SA->>GW: A2A call + Bearer token
+    GW->>GW: verify (alg-pinned, iss, aud, exp)
+    GW->>GW: enforce required scopes
+    GW->>GW: token-bucket rate limit (per sub)
+    GW-->>H: AuthContext { subject, scopes, actForUser }
+        </pre>
+        <div class="caption">Client-credentials grant → verified, scoped, rate-limited request.</div>
+      </div>
+
+      <h2>1 · JWTs with EdDSA — and algorithm pinning</h2>
+      <p>Access tokens are short-lived (minutes) <strong>EdDSA (Ed25519)</strong> JWTs: small, fast, and free of the parameter-choice foot-guns of RSA. The single most important verification rule is <strong>pin the algorithm</strong> — never trust the token header's <code>alg</code>.</p>
+      <pre><code class="language-typescript">await jwtVerify(token, publicKey, {
+  algorithms: [JWT_ALG],   // pin EdDSA — rejects "none" and alg-confusion attacks
+  issuer:   opts.issuer,   // who minted it
+  audience: opts.audience, // who it's for (this resource server)
+  clockTolerance: 30,      // small skew window for exp/nbf
+});</code></pre>
+      <div class="callout danger"><strong>Attack prevented —</strong> a classic JWT exploit sends <code>{"alg":"none"}</code> or swaps RS256→HS256 to forge tokens. Pinning the expected algorithm on verify shuts both down.</div>
+
+      <h2>2 · Agent-card signatures over canonical JSON</h2>
+      <p>Before trusting any peer, an agent verifies that peer's <strong>Agent Card</strong> signature. We sign a <strong>canonical</strong> serialization (recursively sorted keys) so re-serialization on the verifying side reproduces the exact signed bytes. The signature is a detached compact JWS carried in a sibling <code>proof</code> field, leaving the card human-readable.</p>
+      <pre><code class="language-typescript">// Canonicalize → sign body → attach proof.
+const canonical = canonicalize(cardWithoutProof);            // stable key order
+const jws = await new CompactSign(encode(canonical))
+  .setProtectedHeader({ alg: 'EdDSA', kid: verificationMethod })
+  .sign(privateKey);
+
+// Verify: re-canonicalize the body and compare against the signed payload.
+if (signedCanonical !== canonicalize(body))
+  throw new CardSignatureError('Card body does not match its signature', 'PAYLOAD_MISMATCH');</code></pre>
+      <div class="callout warn"><strong>Why canonicalize?</strong> JSON key order and whitespace aren't stable across languages. Without canonicalization a semantically-identical card fails verification — or an attacker reorders fields to confuse a naive verifier.</div>
+
+      <h2>3 · OAuth2 client-credentials with scope down-scoping</h2>
+      <p>Agents authenticate machine-to-machine via the <strong>client-credentials</strong> grant. The authorization server validates the client and grants only the intersection of requested scopes and the client's pre-authorized scopes.</p>
+      <pre><code class="language-typescript">const allowed = new Set(client.allowedScopes);
+const granted = requestedScopes.filter((s) => allowed.has(s));
+const denied  = requestedScopes.filter((s) => !allowed.has(s));
+if (denied.length) throw new OAuth2Error('invalid_scope', `Client may not request: ${denied}`);</code></pre>
+      <p>The client-side <code>OAuth2Client</code> caches the token and refreshes it shortly before expiry, so in-flight requests never carry an expired token.</p>
+
+      <h2>4 · Token-bucket rate limiting</h2>
+      <p>Token bucket is the right default for agent traffic: it allows short <strong>bursts</strong> (an agent fanning out to many merchants at checkout) while bounding the <strong>sustained</strong> rate. Refill is <strong>lazy</strong> — no timers; we compute regenerated tokens from elapsed time in O(1) per request.</p>
+      <div class="diagram">
+        <pre class="mermaid">
+flowchart LR
+    REQ["Request (cost)"] --> REFILL["Lazy refill:<br/>tokens += elapsed × rate<br/>(capped at capacity)"]
+    REFILL --> CHK{"tokens ≥ cost?"}
+    CHK -->|yes| OK["allow · tokens -= cost"]
+    CHK -->|no| NO["block · Retry-After = deficit / rate"]
+        </pre>
+        <div class="caption">Burst-friendly, sustained-rate-bounded, per-agent keyed.</div>
+      </div>
+
+      <h2>The gateway: composing it all</h2>
+      <p>The <code>AuthGateway</code> is the single request guard a resource server runs on every inbound A2A call. It returns a typed <code>AuthContext</code> downstream handlers can trust, or a precise failure.</p>
+      <pre><code class="language-typescript">const result = await gateway.authorize({
+  authorizationHeader: req.headers.authorization,
+  requiredScopes: ['checkout:execute'],
+  cost: 5,                       // expensive endpoints spend more rate budget
+});
+if (!result.ok) {
+  switch (result.failure.kind) {
+    case 'unauthenticated': return res.status(401);
+    case 'forbidden':       return res.status(403);
+    case 'rate_limited':    return res.status(429)
+      .set('Retry-After', String(result.failure.retryAfterSeconds));
+  }
+}
+// result.context.subject / scopes / actForUser are now trusted.</code></pre>
+
+      <h2>Security checklist baked in</h2>
+      <table>
+        <thead><tr><th>Control</th><th>Where</th></tr></thead>
+        <tbody>
+          <tr><td>Algorithm pinning on verify</td><td><code>auth/jwt.ts</code></td></tr>
+          <tr><td>Issuer + audience + expiry validation</td><td><code>auth/jwt.ts</code></td></tr>
+          <tr><td>Short token lifetimes + client-side refresh</td><td><code>auth/oauth2.ts</code></td></tr>
+          <tr><td>Secrets stored hashed, never plaintext</td><td><code>auth/oauth2.ts</code></td></tr>
+          <tr><td>Scope down-scoping (least privilege)</td><td><code>auth/oauth2.ts</code></td></tr>
+          <tr><td>Canonical-JSON signature verification + tamper detection</td><td><code>auth/agent-card-signature.ts</code></td></tr>
+          <tr><td>Per-subject rate limiting</td><td><code>auth/rate-limiter.ts</code></td></tr>
+          <tr><td><code>jti</code> on tokens (replay/revocation anchor)</td><td><code>auth/jwt.ts</code></td></tr>
+        </tbody>
+      </table>
+
+      <h2>Try it</h2>
+      <pre><code class="language-bash">npm run demo:auth</code></pre>
+      <pre><code class="language-text">=== Gateway authorization checks ===
+  checkout:execute allowed -> true
+  payment:authorize allowed -> false (forbidden)
+=== Rate limiting (capacity 3) ===
+  request 1: allowed
+  request 2: allowed
+  request 3: blocked (rate_limited)
+=== Agent card signature ===
+  verified card: FleetFoot Merchant Agent
+  tamper detected -> Card body does not match its signature</code></pre>
+
+      <div class="pager">
+        <a href="checkout.html"><span class="dir">← Previous</span><span class="title">Checkout orchestration</span></a>
+        <a class="next" href="protocols.html"><span class="dir">Next →</span><span class="title">UCP · A2A · Agent Cards</span></a>
+      </div>
+      <footer class="site">MIT © 2026 Arjun Basu</footer>
+    </main>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+  <script src="../js/main.js"></script>
+</body>
+</html>

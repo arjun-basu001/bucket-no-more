@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Checkout Orchestration · bucket-no-more</title>
+  <link rel="stylesheet" href="../css/style.css" />
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css" />
+</head>
+<body>
+  <button class="menu-toggle" aria-label="Toggle menu">☰</button>
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="brand"><span class="logo">🛒</span> bucket-no-more</div>
+      <p class="tagline">One basket. Many merchants.</p>
+      <nav>
+        <div class="nav-group">
+          <h4>Overview</h4>
+          <a href="../index.html">Introduction</a>
+          <a href="../index.html#architecture">Architecture</a>
+          <a href="../index.html#quickstart">Quick start</a>
+        </div>
+        <div class="nav-group">
+          <h4>Deep dives</h4>
+          <a href="checkout.html">🧩 Checkout orchestration</a>
+          <a href="auth.html">🔐 Auth &amp; Authz</a>
+        </div>
+        <div class="nav-group">
+          <h4>Protocols</h4>
+          <a href="protocols.html">UCP · A2A · Agent Cards</a>
+        </div>
+        <div class="nav-group">
+          <h4>Reference</h4>
+          <a href="https://github.com/arjun-basu001/bucket-no-more">GitHub repo ↗</a>
+        </div>
+      </nav>
+    </aside>
+
+    <main class="content">
+      <span class="badge teal">DEEP DIVE</span>
+      <h1>🧩 Multi-merchant checkout orchestration</h1>
+      <p class="lead muted">How one basket commits across many merchants — atomically enough that the user is never half-charged.</p>
+
+      <h2>The problem</h2>
+      <p>A single Universal Cart spans <strong>N independent merchants</strong>, each with their own commerce backend you do not control. There is no global two-phase-commit coordinator across third parties, so <strong>true ACID atomicity is impossible</strong>. But the user's expectation is simple and absolute:</p>
+      <div class="callout"><strong>"Either everything I ordered is placed, or nothing is charged."</strong></div>
+      <p>We satisfy that expectation with a <strong>Try-Confirm/Cancel (TCC) saga</strong>. The orchestrator is a distributed saga coordinator built on four adapter primitives and their compensations.</p>
+
+      <h2>The adapter contract</h2>
+      <p>The orchestrator never talks to a merchant directly. It speaks the <code>MerchantAdapter</code> interface, which models a compensatable, two-phase checkout. Every method must be <strong>idempotent</strong> with respect to its idempotency key — the single most important property for safe retries and rollback.</p>
+      <pre><code class="language-typescript">export interface MerchantAdapter {
+  readonly merchantId: MerchantId;
+
+  // Phase 1 — reversible
+  reserve(cart, ctx):    Promise&lt;Result&lt;Reservation&gt;&gt;;   // hold inventory + lock price
+  authorize(res, ctx):   Promise&lt;Result&lt;Authorization&gt;&gt;; // hold funds (no money moves)
+
+  // Phase 2 — commit
+  capture(auth, ctx):    Promise&lt;Result&lt;Settlement&gt;&gt;;    // move the held funds
+  confirm(set, ctx):     Promise&lt;Result&lt;Settlement&gt;&gt;;    // book into fulfilment
+
+  // Compensations
+  cancelReservation(res, ctx): Promise&lt;Result&lt;void&gt;&gt;;
+  voidAuthorization(auth, ctx): Promise&lt;Result&lt;void&gt;&gt;;
+  refund(set, ctx):            Promise&lt;Result&lt;void&gt;&gt;;
+}</code></pre>
+
+      <div class="callout">
+        <strong>Why split <code>authorize</code> from <code>capture</code>?</strong> We place a <em>hold</em> on funds and inventory across <em>every</em> merchant first, and only <em>capture</em> once the whole basket is guaranteed. If anything fails before capture, rollback is clean and free — no money ever moved. This mirrors the <strong>AP2</strong> mandate model.
+      </div>
+
+      <h2>The two-phase flow</h2>
+      <div class="diagram">
+        <pre class="mermaid">
+sequenceDiagram
+    participant O as Orchestrator
+    participant A as Merchant A
+    participant B as Merchant B
+    Note over O,B: Phase 1 — reversible (ALL merchants, in parallel)
+    O->>A: reserve
+    A-->>O: Reservation (price + inventory hold)
+    O->>A: authorize
+    A-->>O: Authorization (funds hold)
+    O->>B: reserve + authorize
+    B-->>O: ok
+    Note over O,B: Phase 2 — commit (only if ALL passed phase 1)
+    O->>A: capture + confirm
+    A-->>O: Settlement + confirmation
+    O->>B: capture + confirm
+    B-->>O: Settlement + confirmation
+    O-->>O: status = COMMITTED
+        </pre>
+        <div class="caption">Happy path: hold everywhere, then commit everywhere.</div>
+      </div>
+
+      <h2>The state machine</h2>
+      <p>Each merchant branch is a small state machine. Illegal transitions throw at runtime, catching a whole class of orchestration bugs. The orchestration state is the <strong>saga log</strong> — persist it after every transition and a crashed coordinator can resume or roll back deterministically.</p>
+      <div class="diagram">
+        <pre class="mermaid">
+stateDiagram-v2
+    [*] --> PENDING
+    PENDING --> RESERVED
+    RESERVED --> AUTHORIZED
+    AUTHORIZED --> CAPTURED
+    CAPTURED --> CONFIRMED
+    CONFIRMED --> [*]
+    RESERVED --> COMPENSATING
+    AUTHORIZED --> COMPENSATING
+    CAPTURED --> COMPENSATING
+    PENDING --> FAILED
+    FAILED --> COMPENSATING
+    COMPENSATING --> COMPENSATED
+    COMPENSATED --> [*]
+        </pre>
+        <div class="caption">Per-merchant branch lifecycle with compensation paths.</div>
+      </div>
+
+      <h2>Rollback: the path that matters most</h2>
+      <p>If <strong>any</strong> merchant fails phase 1, the orchestrator compensates every merchant that got as far as reserve/authorize. Nothing was captured, so the user is never charged.</p>
+      <div class="diagram">
+        <pre class="mermaid">
+flowchart LR
+    P1{"All merchants<br/>reserved + authorized?"}
+    P1 -->|yes| COMMIT["Phase 2: capture + confirm"]
+    P1 -->|no| RB["Rollback every branch"]
+    RB --> V["voidAuthorization"]
+    V --> C["cancelReservation"]
+    C --> DONE["status =<br/>ROLLED_BACK<br/>(no charge)"]
+    COMMIT -->|capture fails midway| RF["Best-effort refund<br/>of captured merchants"]
+    RF --> INC["Loud operational signal<br/>for reconciliation"]
+        </pre>
+        <div class="caption">Cheap rollback before capture; best-effort refund after.</div>
+      </div>
+
+      <pre><code class="language-typescript">// From orchestrator.ts — the top-level decision tree.
+const phase1 = await this.runPhase1(state, request, correlationId, log);
+if (!phase1.ok) {
+  // Nothing captured yet → clean rollback for everyone.
+  await this.compensateAll(state, request, correlationId, log);
+  setOrchestrationStatus(state, OrchestrationStatus.PARTIALLY_FAILED_ROLLED_BACK);
+  return ok(this.toOutcome(state));
+}
+
+const phase2 = await this.runPhase2(state, request, correlationId, log);
+if (!phase2.ok) {
+  // Past the cheap-rollback boundary → best-effort refunds, surfaced loudly.
+  await this.refundCaptured(state, request, correlationId, log);
+  setOrchestrationStatus(state, OrchestrationStatus.PARTIALLY_FAILED_ROLLED_BACK);
+  return ok(this.toOutcome(state));
+}
+
+setOrchestrationStatus(state, OrchestrationStatus.COMMITTED);</code></pre>
+
+      <h2>Edge cases handled explicitly</h2>
+      <table>
+        <thead><tr><th>Edge case</th><th>Handling</th></tr></thead>
+        <tbody>
+          <tr><td>Partial phase-1 success</td><td>Full rollback of every branch; user not charged</td></tr>
+          <tr><td>Reservation expiry between phases</td><td>Checked (with clock skew) <em>before</em> any capture; abort if expired</td></tr>
+          <tr><td>Partial phase-2 failure</td><td>Best-effort refund of captured merchants + <code>PARTIALLY_FAILED</code> status</td></tr>
+          <tr><td>Transient network errors</td><td>Bounded retries with full-jitter exponential backoff — only when <code>retryable</code></td></tr>
+          <tr><td>Duplicate / retried calls</td><td>Per-step idempotency keys: <code>cartId:merchant:step</code></td></tr>
+          <tr><td>Compensation that itself fails</td><td>Logged as an incident; never throws past the boundary</td></tr>
+          <tr><td>Empty merchant set / missing adapter</td><td>Rejected before any side effects</td></tr>
+        </tbody>
+      </table>
+
+      <h2>Idempotency keys</h2>
+      <p>Retries are only safe if repeated calls are no-ops. The orchestrator derives a deterministic key per <em>(orchestration, merchant, step)</em>, so a retried <code>capture</code> returns the same settlement instead of charging twice:</p>
+      <pre><code class="language-typescript">idempotencyKey: `${cart.cartId}:${merchantId}:${step}`  // e.g. "cart-001:merchant.roastery:capture"</code></pre>
+
+      <h2>Try it</h2>
+      <pre><code class="language-bash">npm run demo:checkout</code></pre>
+      <pre><code class="language-text">=== Scenario B: merchant.fleetfoot fails at authorize -> rollback ===
+  status: PARTIALLY_FAILED_ROLLED_BACK
+  merchant.audiophile events: [ reserved, authorized, authorization-voided, reservation-cancelled ]
+  merchant.fleetfoot  events: [ reserved, reservation-cancelled ]
+  merchant.roastery   events: [ reserved, authorized, authorization-voided, reservation-cancelled ]</code></pre>
+
+      <div class="pager">
+        <a href="../index.html"><span class="dir">← Back</span><span class="title">Overview</span></a>
+        <a class="next" href="auth.html"><span class="dir">Next →</span><span class="title">Auth &amp; Authz deep dive</span></a>
+      </div>
+      <footer class="site">MIT © 2026 Arjun Basu</footer>
+    </main>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+  <script src="../js/main.js"></script>
+</body>
+</html>
